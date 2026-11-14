@@ -1,120 +1,92 @@
-import pandas as pd
+"""
+Pipeline de Triagem de Avaliações (Olist) com Abstenção Dupla e Calibração.
+Autor: Davi C. Maciel
+Descrição: Script de treinamento comparativo entre TF-IDF de Palavras (Modelo A) 
+e Caracteres (Modelo B), utilizando validação temporal, isolamento estrito de 
+clientes (zero leakage), calibração fora-da-dobra e limiares via Limite Inferior de Wilson.
+"""
+
+import math
 import numpy as np
-from sklearn.model_selection import train_test_split
+import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import classification_report, precision_score, brier_score_loss, roc_auc_score
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from sklearn.pipeline import Pipeline
-import warnings
 import skops.io as sio
-from huggingface_hub import HfApi, login
-from kaggle_secrets import UserSecretsClient
+import warnings
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=DeprecationWarning)
 
-# 1. CARREGAMENTO DOS DADOS
-print("Carregando bases...")
-reviews = pd.read_csv('/kaggle/input/datasets/olistbr/brazilian-ecommerce/olist_order_reviews_dataset.csv')
-orders = pd.read_csv('/kaggle/input/datasets/olistbr/brazilian-ecommerce/olist_orders_dataset.csv')
-customers = pd.read_csv('/kaggle/input/datasets/olistbr/brazilian-ecommerce/olist_customers_dataset.csv')
+Z = 1.96
 
-# 2. MERGE E LIMPEZA
-df = reviews.merge(orders[['order_id', 'customer_id', 'order_purchase_timestamp']], on='order_id', how='left')
-df = df.merge(customers[['customer_id', 'customer_unique_id']], on='customer_id', how='left')
+def wilson(k, n):
+    """Calcula o intervalo de confiança de Wilson para penalizar precisão em amostras pequenas."""
+    if n == 0: return 0.0, 1.0
+    p, d = k / n, 1 + Z * Z / n
+    c = (p + Z * Z / (2 * n)) / d
+    h = Z * math.sqrt(p * (1 - p) / n + Z * Z / (4 * n * n)) / d
+    return max(0.0, c - h), min(1.0, c + h)
 
-df = df.dropna(subset=['review_comment_message']).copy()
-df = df.drop_duplicates(subset=['review_comment_message'])
+def ece(p, y, bins=10):
+    """Calcula o Expected Calibration Error (ECE)."""
+    idx = np.minimum((p * bins).astype(int), bins - 1)
+    return float(sum(abs(p[idx == b].mean() - y[idx == b].mean()) * (idx == b).mean() for b in range(bins) if (idx == b).any()))
 
-# Remove a nota 3 (ambígua) e criamos o alvo binário
-df = df[df['review_score'] != 3].copy()
-df['is_negative'] = df['review_score'].apply(lambda x: 1 if x <= 2 else 0)
+def escolher_limiar(conf, acertou, alvo=0.95, min_n=50):
+    """Encontra o menor limiar de confiança cujo limite inferior de Wilson atinge a meta (95%)."""
+    for t in np.linspace(0.5, 0.999, 200):
+        sel = conf >= t
+        n, k = int(sel.sum()), int(acertou[sel].sum())
+        if n >= min_n and wilson(k, n)[0] >= alvo:
+            return float(t)
+    return None
 
-# Ordenação temporal
-df['order_purchase_timestamp'] = pd.to_datetime(df['order_purchase_timestamp'])
-df = df.sort_values(by='order_purchase_timestamp').reset_index(drop=True)
+def decidir(p_neg, t_neg, t_pos):
+    """Aplica abstenção dupla: 1 (Negativa Segura), 0 (Positiva Segura) ou -1 (Revisão Humana)."""
+    d = np.full(len(p_neg), -1)
+    if t_neg is not None: d[p_neg >= t_neg] = 1
+    if t_pos is not None: d[(1 - p_neg) >= t_pos] = 0
+    return d
 
-# 3. DIVISÃO SEM VAZAMENTO (TEMPORAL + ISOLAMENTO DE CLIENTE)
-split_idx = int(len(df) * 0.8)
-train_val_df = df.iloc[:split_idx].copy()
-test_df = df.iloc[split_idx:].copy()
+def treinar_e_avaliar(tv: pd.DataFrame, teste: pd.DataFrame, vetorizador, alvo=0.95, seed=42):
+    """Executa o pipeline completo de treino, calibração out-of-fold e avaliação cega."""
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=seed)
+    i_tr, i_val = next(gss.split(tv, groups=tv["cliente"]))
+    tr, val = tv.iloc[i_tr], tv.iloc[i_val]
+    
+    base = Pipeline([
+        ("tfidf", vetorizador),
+        ("clf", LogisticRegression(max_iter=1000, random_state=seed))
+    ])
+    
+    # Calibração Out-of-Fold para evitar vazamento de dados de confiança
+    folds = list(GroupKFold(n_splits=5).split(tr["texto"], tr["y"], groups=tr["cliente"]))
+    cal = CalibratedClassifierCV(base, method="isotonic", cv=folds) 
+    cal.fit(tr["texto"], tr["y"])
+    
+    pv, yv = cal.predict_proba(val["texto"])[:, 1], val["y"].to_numpy()
+    t_neg = escolher_limiar(pv, yv == 1, alvo)
+    t_pos = escolher_limiar(1 - pv, yv == 0, alvo)
+    
+    pt, yt = cal.predict_proba(teste["texto"])[:, 1], teste["y"].to_numpy()
+    d = decidir(pt, t_neg, t_pos)
+    
+    auto = d != -1
+    k, n = int((d[auto] == yt[auto]).sum()), int(auto.sum())
+    lo, hi = wilson(k, n)
+    auto_neg = d == 1
+    k_neg, n_neg = int((d[auto_neg] == yt[auto_neg]).sum()), int(auto_neg.sum())
+    
+    return dict(
+        t_neg=t_neg, t_pos=t_pos, n_total=len(yt), n_auto=n, 
+        cob_global=n / len(yt) if len(yt) else 0, 
+        prec_global=k / n if n else float("nan"), ic95=(lo, hi),
+        cob_neg=n_neg / len(yt) if len(yt) else 0, 
+        prec_neg=k_neg / n_neg if n_neg else float("nan"),
+        ece_teste=ece(pt, yt), pt=pt, yt=yt, modelo_treinado=cal
+    )
 
-# Remove do teste qualquer cliente que já apareceu no passado
-test_df = test_df[~test_df['customer_unique_id'].isin(train_val_df['customer_unique_id'])]
-
-X_tv = train_val_df['review_comment_message']
-y_tv = train_val_df['is_negative']
-
-X_train, X_val, y_train, y_val = train_test_split(
-    X_tv, y_tv, test_size=0.3, random_state=42, stratify=y_tv
-)
-
-print(f"Treino: {len(X_train)} | Val: {len(X_val)} | Teste: {len(test_df)}")
-
-# 4. TREINO BASELINE E CALIBRAÇÃO
-print("\nTreinando TF-IDF + Regressão Logística...")
-pipeline = Pipeline([
-    ('tfidf', TfidfVectorizer(max_features=10000, ngram_range=(1,2))),
-    ('clf', LogisticRegression(class_weight='balanced', max_iter=1000, random_state=42))
-])
-
-pipeline.fit(X_train, y_train)
-
-print("Calibrando probabilidades (Regressão Isotônica)...")
-calibrated_clf = CalibratedClassifierCV(pipeline, method='isotonic', cv='prefit')
-calibrated_clf.fit(X_val, y_val) 
-
-# 5. BUSCA DO LIMIAR PARA 95% DE PRECISÃO
-probs_val = calibrated_clf.predict_proba(X_val)[:, 1]
-brier = brier_score_loss(y_val, probs_val)
-print(f"Brier Score na Validação: {brier:.4f}")
-
-thresholds = np.linspace(0.5, 0.99, 100)
-optimal_threshold = 0.99
-
-for t in thresholds:
-    preds = (probs_val >= t).astype(int)
-    prec = precision_score(y_val, preds, zero_division=0)
-    if prec >= 0.95:
-        optimal_threshold = t
-        break
-
-print(f"Limiar escolhido para >=95% precisão: {optimal_threshold:.4f}")
-
-# 6. TESTE FINAL (FUTURO INÉDITO)
-X_test = test_df['review_comment_message']
-y_test = test_df['is_negative']
-
-probs_test = calibrated_clf.predict_proba(X_test)[:, 1]
-preds_test = (probs_test >= optimal_threshold).astype(int)
-
-print("\n--- RESULTADOS FINAIS NO TESTE ---")
-print(classification_report(y_test, preds_test, digits=4))
-print(f"ROC-AUC: {roc_auc_score(y_test, probs_test):.4f}")
-
-# Salva o modelo calibrado que ainda está na memória do notebook para um arquivo físico
-sio.dump(calibrated_clf, "modelo_olist_tfidf_calibrado.skops")
-
-print("Arquivo .skops gerado com sucesso! Agora você pode rodar o bloco de upload.")
-
-# 1. Autenticação via Kaggle Secrets
-user_secrets = UserSecretsClient()
-hf_token = user_secrets.get_secret("HF_TOKEN")
-login(token=hf_token)
-
-# 2. Defina o nome do seu repositório no Hugging Face
-repo_id = "DaviCM/olist-review-triage-calibrated"
-
-# 3. Criação do repositório e upload
-api = HfApi()
-print(f"Criando repositório {repo_id}...")
-api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
-
-print("Fazendo upload do modelo .skops...")
-api.upload_file(
-    path_or_fileobj="modelo_olist_tfidf_calibrado.skops",
-    path_in_repo="modelo_olist_tfidf_calibrado.skops",
-    repo_id=repo_id,
-    repo_type="model"
-)
-print("✅ Deploy concluído com sucesso!")
+if __name__ == "__main__":
+    print("Módulo de motor de triagem carregado. Para executar o pipeline completo, utilize o notebook do Kaggle associado.")
